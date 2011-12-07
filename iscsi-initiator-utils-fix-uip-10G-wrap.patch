@@ -1,0 +1,82 @@
+From d18f846d992629d39a8bd52df21bdc41f50ab325 Mon Sep 17 00:00:00 2001
+From: Benjamin Li <benli@broadcom.com>
+Date: Tue, 27 Jul 2010 13:59:37 -0700
+Subject: [PATCH 2/4] This will fix many of the 10G ring wrapping problems:
+
+* This will fix the CQE wrapping problem.  One way to exhibit this is to login to the target to bring up the uIP stack.  Then ping the IP address of the uIP stack.  Around the 128th packet which is the size of the CQE ring, ping will start seeing duplicate packets.  This is becuse the CQE was wrapping using the BD consumer index rather then the consumer index for the CQE when calculating the new CQE consumer index.
+
+*  Fix a bnx2x BD wrapping problem.
+
+This will fix a BD wrapping problem where when running through the
+entire BD ring, the next BD would be incorrect and push invalid data
+through the stack.
+
+Here the BD consumer index is properly anded with the maximum BD's in
+the ring to properly keep the BD index.
+
+*  Always continue to process the RX ring.  There could be other items
+on the ring other then eth_rx_cqe which will need to be cleaned off
+the ring.
+---
+ brcm_iscsi_uio/src/unix/libs/bnx2x.c |    9 +++++----
+ brcm_iscsi_uio/src/unix/libs/bnx2x.h |    3 +++
+ 2 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/brcm_iscsi_uio/src/unix/libs/bnx2x.c b/brcm_iscsi_uio/src/unix/libs/bnx2x.c
+index ce71109..c1968cf 100644
+--- a/brcm_iscsi_uio/src/unix/libs/bnx2x.c
++++ b/brcm_iscsi_uio/src/unix/libs/bnx2x.c
+@@ -1138,8 +1138,8 @@ static int bnx2x_read(nic_t *nic, packet_t *pkt)
+ 
+ 	hw_cons = bp->get_rx_cons(bp);
+ 	sw_cons = bp->rx_cons;
+-	bd_cons = bp->rx_bd_cons;
+-	bd_prod = bp->rx_bd_prod;
++	bd_cons = BNX2X_RX_BD(bp->rx_bd_cons);
++	bd_prod = BNX2X_RX_BD(bp->rx_bd_prod);
+ 
+ 	if (sw_cons != hw_cons) {
+ 		uint16_t comp_ring_index = sw_cons & BNX2X_MAX_RCQ_DESC_CNT;
+@@ -1147,7 +1147,8 @@ static int bnx2x_read(nic_t *nic, packet_t *pkt)
+ 		union eth_rx_cqe *cqe;
+ 		__u8 cqe_fp_flags;
+ 		void *rx_pkt;
+-		int len, pad = 0;;
++		int len, pad = 0;
++		rc = 1;
+ 
+ 		cqe = &bp->rx_comp_ring[comp_ring_index];
+ 		cqe_fp_flags = cqe->fast_path_cqe.type_error_flags;
+@@ -1199,7 +1200,7 @@ static int bnx2x_read(nic_t *nic, packet_t *pkt)
+ 			bd_prod = BNX2X_NEXT_RX_IDX(bd_prod);
+ 
+ 		}
+-		sw_cons = BNX2X_NEXT_RCQ_IDX(bd_cons);
++		sw_cons = BNX2X_NEXT_RCQ_IDX(sw_cons);
+ 		bp->rx_prod = BNX2X_NEXT_RCQ_IDX(bp->rx_prod);
+ 	}
+ 	bp->rx_cons = sw_cons;
+diff --git a/brcm_iscsi_uio/src/unix/libs/bnx2x.h b/brcm_iscsi_uio/src/unix/libs/bnx2x.h
+index 20c64ad..620f069 100644
+--- a/brcm_iscsi_uio/src/unix/libs/bnx2x.h
++++ b/brcm_iscsi_uio/src/unix/libs/bnx2x.h
+@@ -332,6 +332,8 @@ struct iro {
+ 
+ #define BNX2X_RX_DESC_CNT	(4096 / sizeof(struct eth_rx_bd))
+ #define BNX2X_MAX_RX_DESC_CNT		(BNX2X_RX_DESC_CNT - 2)
++#define BNX2X_NUM_RX_BD			(BNX2X_RX_DESC_CNT * 1)
++#define BNX2X_MAX_RX_BD			(BNX2X_NUM_RX_BD - 1)
+ 
+ #define BNX2X_TX_DESC_CNT	(4096 / sizeof(struct eth_tx_start_bd))
+ #define BNX2X_MAX_TX_DESC_CNT		(BNX2X_TX_DESC_CNT - 1)
+@@ -341,6 +343,7 @@ struct iro {
+ 
+ #define BNX2X_NEXT_RCQ_IDX(x)	((((x) & BNX2X_MAX_RCQ_DESC_CNT) == \
+ 				  (BNX2X_MAX_RCQ_DESC_CNT - 1)) ? (x) + 2 : (x) + 1)
++#define BNX2X_RX_BD(x)		((x) & BNX2X_MAX_RX_BD)
+ 
+ #define BNX2X_NEXT_TX_BD(x) (((x) & (BNX2X_MAX_TX_DESC_CNT - 1)) ==	\
+ 		(BNX2X_MAX_TX_DESC_CNT - 1)) ?				\
+-- 
+1.7.1
+

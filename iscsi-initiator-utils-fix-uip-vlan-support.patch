@@ -1,0 +1,569 @@
+From ba0b093ec377b6dc861b5676b70e96505a678f39 Mon Sep 17 00:00:00 2001
+From: Benajmin Li <benli@broadcom.com> 
+Date: Tue, 20 Jul 2010 22:26:25 -0700
+Subject: [PATCH 1/4] Because in the current iface file doesn't allow one to specify a VLAN
+ tag, the VLAN tag will be taking from the path request given by the CNIC.
+
+This will also allow uIP to close and reopen devices properly.
+---
+ brcm_iscsi_uio/src/unix/iscsid_ipc.c |   40 +++++++++++++++++++-
+ brcm_iscsi_uio/src/unix/libs/bnx2.c  |   14 -------
+ brcm_iscsi_uio/src/unix/libs/bnx2x.c |   14 -------
+ brcm_iscsi_uio/src/unix/nic.c        |   66 ++++++++++++++++++++------------
+ brcm_iscsi_uio/src/unix/nic.h        |   16 +++++++-
+ brcm_iscsi_uio/src/unix/nic_nl.c     |   56 ++++++++++++++++++++++++---
+ brcm_iscsi_uio/src/unix/nic_utils.c  |   70 ++++++++++++++++++++++++++++++++--
+ brcm_iscsi_uio/src/unix/nic_utils.h  |    6 ++-
+ brcm_iscsi_uio/src/unix/uevent.c     |    2 +-
+ 9 files changed, 217 insertions(+), 67 deletions(-)
+
+diff --git a/brcm_iscsi_uio/src/unix/iscsid_ipc.c b/brcm_iscsi_uio/src/unix/iscsid_ipc.c
+index b06100e..4c00ef2 100644
+--- a/brcm_iscsi_uio/src/unix/iscsid_ipc.c
++++ b/brcm_iscsi_uio/src/unix/iscsid_ipc.c
+@@ -131,6 +131,42 @@ static int parse_iface(void * arg)
+ 			 data->u.iface_rec.rec.netdev);
+ 	}
+ 
++	if (nic->flags & NIC_GOING_DOWN) {
++		rc = -EIO;
++		goto done;
++	}
++
++	/*  If we retry too many times allow iscsid to to timeout */
++	if (nic->pending_count > 1000) {
++		LOG_WARN(PFX "%s: pending count excceded 1000",
++		         nic->log_name);
++
++		pthread_mutex_lock(&nic->nic_mutex);
++		nic->pending_count = 0;
++		nic->flags &= ~NIC_ENABLED_PENDING;
++		pthread_mutex_unlock(&nic->nic_mutex);
++
++		rc = 0;
++		goto done;
++	}
++
++	if (nic->flags & NIC_ENABLED_PENDING) {
++		struct timespec sleep_req, sleep_rem;
++
++		sleep_req.tv_sec  = 0;
++		sleep_req.tv_nsec = 100000;
++		nanosleep(&sleep_req, &sleep_rem);
++
++		pthread_mutex_lock(&nic->nic_mutex);
++		nic->pending_count++;
++		pthread_mutex_unlock(&nic->nic_mutex);
++
++		LOG_INFO(PFX "%s: enabled pending",
++		         nic->log_name);
++		rc = -EAGAIN;
++		goto done;
++	}
++
+ 	prepare_nic(nic);
+ 
+ 	/*  Sanity Check to ensure the transport names are the same */
+@@ -210,7 +246,9 @@ static int parse_iface(void * arg)
+ 		goto enable_nic;
+ 	} else {
+ 		/* Disable the NIC */
+-		nic_disable(nic);
++		nic_disable(nic, 0);
++
++		persist_all_nic_iface(nic);
+ 	}
+ 
+ 	/*  Check to see if this is using DHCP or if this is
+diff --git a/brcm_iscsi_uio/src/unix/libs/bnx2.c b/brcm_iscsi_uio/src/unix/libs/bnx2.c
+index 400fd43..2b103b1 100644
+--- a/brcm_iscsi_uio/src/unix/libs/bnx2.c
++++ b/brcm_iscsi_uio/src/unix/libs/bnx2.c
+@@ -788,20 +788,6 @@ static int bnx2_close(nic_t *nic, NIC_SHUTDOWN_T graceful)
+ 
+ 	bnx2_uio_close_resources(nic, graceful);
+ 
+-	/*  Free any named strings we might be holding onto */
+-	if(nic->flags & NIC_CONFIG_NAME_MALLOC) {
+-		free(nic->config_device_name);
+-		nic->flags &= ~NIC_CONFIG_NAME_MALLOC;
+-	}
+-	nic->config_device_name = NULL;
+-
+-	if(nic->flags & NIC_UIO_NAME_MALLOC) {
+-		free(nic->uio_device_name);
+-		nic->uio_device_name = NULL;
+-
+-		nic->flags &= ~NIC_UIO_NAME_MALLOC;
+-	}
+-
+ 	return 0;
+ }
+ 
+diff --git a/brcm_iscsi_uio/src/unix/libs/bnx2x.c b/brcm_iscsi_uio/src/unix/libs/bnx2x.c
+index a3f4fb2..ce71109 100644
+--- a/brcm_iscsi_uio/src/unix/libs/bnx2x.c
++++ b/brcm_iscsi_uio/src/unix/libs/bnx2x.c
+@@ -985,20 +985,6 @@ static int bnx2x_close(nic_t *nic, NIC_SHUTDOWN_T graceful)
+ 
+ 	bnx2x_uio_close_resources(nic, graceful);
+ 
+-	/*  Free any named strings we might be holding onto */
+-	if(nic->flags & NIC_CONFIG_NAME_MALLOC) {
+-		free(nic->config_device_name);
+-		nic->flags &= ~NIC_CONFIG_NAME_MALLOC;
+-	}
+-	nic->config_device_name = NULL;
+-
+-	if(nic->flags & NIC_UIO_NAME_MALLOC) {
+-		free(nic->uio_device_name);
+-		nic->uio_device_name = NULL;
+-
+-		nic->flags &= ~NIC_UIO_NAME_MALLOC;
+-	}
+-
+ 	return 0;
+ }
+ 
+diff --git a/brcm_iscsi_uio/src/unix/nic.c b/brcm_iscsi_uio/src/unix/nic.c
+index da83e2b..2b267f2 100644
+--- a/brcm_iscsi_uio/src/unix/nic.c
++++ b/brcm_iscsi_uio/src/unix/nic.c
+@@ -400,7 +400,7 @@ nic_t *nic_init()
+ 	return nic;
+ }
+ 
+-int nic_remove(nic_t *nic, int locked)
++int nic_remove(nic_t *nic)
+ {
+ 	int rc;
+ 	nic_t *prev, *current;
+@@ -422,9 +422,6 @@ int nic_remove(nic_t *nic, int locked)
+ 
+ 	nic->thread = INVALID_THREAD;
+ 
+-	if(!locked)
+-		pthread_mutex_lock(&nic_list_mutex);
+-
+ 	current = prev = nic_list;
+ 	while(current != NULL) {
+ 		if(current == nic)
+@@ -445,9 +442,6 @@ int nic_remove(nic_t *nic, int locked)
+ 		LOG_ERR(PFX "%s: Coudln't find nic", nic->log_name);
+ 	}
+ 
+-	if(!locked)
+-		pthread_mutex_unlock(&nic_list_mutex);
+-
+ 	return 0;
+ }
+ 
+@@ -459,16 +453,14 @@ int nic_remove(nic_t *nic, int locked)
+  *                     before proceeding to close()
+  *                     FORCE_SHUTDOWN will force the nic to close()
+  *                     reguardless of the state
++ *  @param clean    -  this will free the proper strings assoicated
++ *                     with the NIC
+  */
+-void nic_close(nic_t *nic, NIC_SHUTDOWN_T graceful)
++void nic_close(nic_t *nic, NIC_SHUTDOWN_T graceful, int clean)
+ {
+ 	int rc;
+ 	nic_interface_t *nic_iface;
+ 
+-	if((nic->flags & NIC_DISABLED) &&
+-	   (graceful == ALLOW_GRACEFUL_SHUTDOWN))
+-		return;
+-
+ 	/*  The NIC could be configured by the uIP config file
+ 	 *  but not assoicated with a hardware library just yet
+ 	 *  we will need to check for this */
+@@ -491,10 +483,36 @@ void nic_close(nic_t *nic, NIC_SHUTDOWN_T graceful)
+ 	while(nic_iface != NULL)
+ 	{
+ 		nic_iface->state = NIC_IFACE_STOPPED;
+-		uip_reset(&nic_iface->ustack);
++		if (!((nic_iface->state & NIC_IFACE_PERSIST) ==
++		       NIC_IFACE_PERSIST))
++			uip_reset(&nic_iface->ustack);
+ 		nic_iface = nic_iface->next;
+ 	}
+ 
++	/*  The NIC must be destroyed and init'ed once again,
++	 *  POSIX defines that the mutex will be undefined it
++	 *  init'ed twice without a destroy */
++	pthread_mutex_destroy(&nic->xmit_mutex);
++	pthread_mutex_init(&nic->xmit_mutex, NULL);
++
++	if (clean & FREE_CONFIG_NAME) {
++		/*  Free any named strings we might be holding onto */
++		if(nic->flags & NIC_CONFIG_NAME_MALLOC) {
++			free(nic->config_device_name);
++			nic->flags &= ~NIC_CONFIG_NAME_MALLOC;
++		}
++		nic->config_device_name = NULL;
++	}
++
++	if (clean & FREE_UIO_NAME) {
++		if(nic->flags & NIC_UIO_NAME_MALLOC) {
++			free(nic->uio_device_name);
++			nic->uio_device_name = NULL;
++
++			nic->flags &= ~NIC_UIO_NAME_MALLOC;
++		}
++	}
++	LOG_ERR(PFX "%s: nic closed", nic->log_name);
+ error:
+ 	return;
+ }
+@@ -1138,6 +1156,8 @@ void *nic_loop(void *arg)
+ 				pthread_mutex_lock(&nic->nic_mutex);
+ 
+ 				if (rc) {
++					LOG_ERR(PFX "%s: DHCP failed",
++						nic->log_name);
+ 					pthread_mutex_unlock(&nic->nic_mutex);
+ 					goto dev_close;
+ 				}
+@@ -1164,6 +1184,9 @@ void *nic_loop(void *arg)
+                         goto dev_close;
+ 		}
+ 
++		pthread_mutex_lock(&nic->nic_mutex);
++		unpersist_all_nic_iface(nic);
++
+ 		/*  This is when we start the processing of packets */
+ 		nic->start_time = time(NULL);
+ 		nic->flags &= ~NIC_UNITIALIZED;
+@@ -1171,8 +1194,9 @@ void *nic_loop(void *arg)
+ 		nic->state &= ~NIC_STOPPED;
+ 		nic->state |= NIC_RUNNING;
+ 
++		nic->flags &= ~NIC_ENABLED_PENDING;
++
+                 /*  Signal that the device enable is done */
+-		pthread_mutex_lock(&nic->nic_mutex);
+ 		pthread_cond_broadcast(&nic->enable_done_cond);
+ 		pthread_mutex_unlock(&nic->nic_mutex);
+ 
+@@ -1197,17 +1221,11 @@ void *nic_loop(void *arg)
+ dev_close:
+ 		pthread_mutex_lock(&nic->nic_mutex);
+ 
+-		/*  Ensure that the IP configuration is cleared */
+-		nic_iface = nic->nic_iface;
+-		while(nic_iface != NULL)
+-		{
+-			nic_iface->ustack.ip_config =
+-				(IPV4_CONFIG_OFF | IPV6_CONFIG_OFF);
+-			nic_iface = nic_iface->next;
+-		}
+-
+ 		nic->state = NIC_STOPPED;
+-		nic_close(nic, 1);
++		nic_close(nic, 1, FREE_NO_STRINGS);
++
++		nic->flags |= NIC_UNITIALIZED;
++		nic->flags &= ~NIC_INITIALIZED;
+ 
+ 		/*  Signal we are done closing CNIC/UIO device */
+ 		pthread_cond_broadcast(&nic->disable_wait_cond);
+diff --git a/brcm_iscsi_uio/src/unix/nic.h b/brcm_iscsi_uio/src/unix/nic.h
+index 097230a..7636948 100644
+--- a/brcm_iscsi_uio/src/unix/nic.h
++++ b/brcm_iscsi_uio/src/unix/nic.h
+@@ -45,6 +45,11 @@ extern struct nic *nic_list;
+ #define MAX_PCI_DEVICE_ENTRIES	64	/* Maxium number of pci_device_id
+ 					   entries a hw library may contain */
+ 
++#define FREE_CONFIG_NAME	0x0001
++#define FREE_UIO_NAME		0x0002
++#define FREE_ALL_STRINGS	FREE_CONFIG_NAME | FREE_UIO_NAME
++#define FREE_NO_STRINGS		0x0000
++
+ /******************************************************************************
+  * Enumerations
+  ******************************************************************************/
+@@ -89,6 +94,7 @@ typedef struct nic_interface {
+ 
+ 	uint16_t	protocol;
+ 	uint16_t	flags;
++#define NIC_IFACE_PERSIST       0x0001
+ 	uint16_t	state;	
+ #define NIC_IFACE_STOPPED	0x0001
+ #define NIC_IFACE_RUNNING	0x0002
+@@ -173,9 +179,12 @@ typedef struct nic {
+ #define NIC_VLAN_STRIP_ENABLED	0x0100
+ #define NIC_MSIX_ENABLED	0x0200
+ #define NIC_TX_HAS_SENT		0x0400
++#define NIC_ENABLED_PENDING	0x0800
+ 
+ #define NIC_UIO_NAME_MALLOC	0x1000
+ #define NIC_CONFIG_NAME_MALLOC	0x2000
++#define NIC_EXIT_MAIN_LOOP	0x4000
++#define NIC_GOING_DOWN		0x8000
+ 
+ 	uint16_t state;
+ #define NIC_STOPPED	0x0001
+@@ -236,6 +245,9 @@ typedef struct nic {
+ 	time_t start_time;
+ 	struct nic_stats	stats;
+ 
++	/*  Number of retrys from iscsid*/
++	uint32_t pending_count;
++
+ #define DEFAULT_RX_POLL_USEC	100	/* usec */
+ 	/* options enabled by the user */
+ 	uint32_t rx_poll_usec;
+@@ -271,7 +283,7 @@ typedef struct nic {
+ int load_all_nic_libraries();
+ 
+ nic_t *nic_init();
+-int nic_remove(nic_t * nic, int locked);
++int nic_remove(nic_t * nic);
+ 
+ int nic_add_nic_iface(nic_t *nic,
+                       nic_interface_t *nic_iface);
+@@ -298,7 +310,7 @@ void put_packet_in_free_queue(struct packet *pkt,
+                               nic_t *nic);
+ 
+ int unload_all_nic_libraries();
+-void nic_close(nic_t *nic, NIC_SHUTDOWN_T graceful);
++void nic_close(nic_t *nic, NIC_SHUTDOWN_T graceful, int clean);
+ 
+ /*  Use this function to fill in minor number and uio, and eth names */
+ int nic_fill_name(nic_t *nic);
+diff --git a/brcm_iscsi_uio/src/unix/nic_nl.c b/brcm_iscsi_uio/src/unix/nic_nl.c
+index fa4033a..c624689 100644
+--- a/brcm_iscsi_uio/src/unix/nic_nl.c
++++ b/brcm_iscsi_uio/src/unix/nic_nl.c
+@@ -347,11 +347,51 @@ static int ctldev_handle()
+ 		nic_iface = nic_find_nic_iface_protocol(nic, path->vlan_id,
+ 							ip_type);
+ 		if (nic_iface == NULL) {
+-			LOG_WARN(PFX "%s: Couldn't find nic_iface  "
+-				     "vlan: %d ip_addr_len",
+-				 nic->log_name,
+-				 path->vlan_id, path->ip_addr_len);
+-			goto error;
++			nic_interface_t *default_iface;
++			default_iface = nic_find_nic_iface_protocol(nic,
++								    0,
++								    ip_type);
++			if (default_iface == NULL)
++			{
++				LOG_ERR(PFX "%s: Couldn't find default iface "
++					    "vlan: %d ip_type: %d "
++					    "ip_addr_len: %d to clone",
++					nic->log_name,                                                                  path->vlan_id, ip_type,
++					path->ip_addr_len);
++				goto error;
++			}
++
++			nic_iface = nic_iface_init();
++			if (nic_iface == NULL)
++			{
++				LOG_ERR(PFX "%s: Couldn't allocate space for "
++					    "vlan: %d ip_type: %d "
++					    "ip_addr_len: %d",
++					nic->log_name,                                                                  path->vlan_id, ip_type,
++					path->ip_addr_len);
++
++				goto error;
++			}
++
++			nic_iface->protocol = ip_type;
++			nic_iface->vlan_id = path->vlan_id;
++			nic_add_nic_iface(nic, nic_iface);
++
++			/* TODO: When VLAN support is placed in the iface file
++ 			 * revisit this code */
++			nic_iface->ustack.ip_config = default_iface->ustack.ip_config;
++			memcpy(&nic_iface->ustack.hostaddr,
++			       &default_iface->ustack.hostaddr,
++			       sizeof(nic_iface->ustack.hostaddr));
++			memcpy(&nic_iface->ustack.netmask,
++			       &default_iface->ustack.netmask,
++			       sizeof(nic_iface->ustack.netmask));
++			memcpy(&nic_iface->ustack.hostaddr6,
++			       &default_iface->ustack.hostaddr6,
++			       sizeof(nic_iface->ustack.hostaddr6));
++
++			nic_disable(nic, 0);
++			nic_enable(nic);
+ 		}
+ 
+ 		/*  Ensure that the NIC is RUNNING */
+@@ -386,7 +426,11 @@ static int ctldev_handle()
+ 			}
+ 			break;
+ 		case ISCSI_KEVENT_IF_DOWN:
+-			nic_remove(nic, 0);
++
++			pthread_mutex_lock(&nic_list_mutex);
++			nic_disable(nic, 1);
++			nic_remove(nic);
++			pthread_mutex_unlock(&nic_list_mutex);
+ 
+ 			break;
+ 		}
+diff --git a/brcm_iscsi_uio/src/unix/nic_utils.c b/brcm_iscsi_uio/src/unix/nic_utils.c
+index 0e36a67..eabb474 100644
+--- a/brcm_iscsi_uio/src/unix/nic_utils.c
++++ b/brcm_iscsi_uio/src/unix/nic_utils.c
+@@ -787,6 +787,7 @@ int nic_enable(nic_t *nic)
+ 
+ 		nic->flags &= ~NIC_DISABLED;
+ 		nic->flags |= NIC_ENABLED;
++		nic->flags |= NIC_ENABLED_PENDING;
+ 
+ 		pthread_mutex_unlock(&nic->nic_mutex);
+ 
+@@ -811,6 +812,8 @@ int nic_enable(nic_t *nic)
+ 				 nic->log_name, strerror(rc));
+ 			return rc;
+ 		}
++
++		nic->flags &= ~NIC_ENABLED_PENDING;
+ 	}
+ 	else
+ 	{
+@@ -826,11 +829,15 @@ int nic_enable(nic_t *nic)
+  *  @param nic - NIC to disble
+  *  @return 0 on success, <0 on failure
+  */
+-int nic_disable(nic_t *nic)
++int nic_disable(nic_t *nic, int going_down)
+ {
+ 	if( (nic->flags & NIC_ENABLED) &&
+ 	    (nic->state & NIC_RUNNING))
+ 	{
++		struct timespec   ts;
++		struct timeval    tp;
++		int rc;
++
+ 		/*  Wait for the device to be disabled */
+ 		pthread_mutex_lock(&nic->nic_mutex);
+ 
+@@ -839,8 +846,23 @@ int nic_disable(nic_t *nic)
+ 		nic->state &= ~NIC_RUNNING;
+ 		nic->state |= NIC_STOPPED;
+ 
+-		pthread_cond_wait(&nic->disable_wait_cond,
+-				  &nic->nic_mutex);
++		if (going_down) {
++			nic->flags |= NIC_GOING_DOWN;
++
++			if (nic->thread != INVALID_THREAD) {
++				pthread_cancel(nic->thread);
++			}
++		}
++
++		/* Convert from timeval to timespec */
++		rc =  gettimeofday(&tp, NULL);
++		ts.tv_sec  = tp.tv_sec;
++		ts.tv_nsec = tp.tv_usec * 1000;
++		ts.tv_sec += 2; /*  TODO: hardcoded wait for 2 seconds */
++
++		/*  Wait for the device to be disabled */
++		rc = pthread_cond_timedwait(&nic->disable_wait_cond,
++					    &nic->nic_mutex, &ts);
+ 		pthread_mutex_unlock(&nic->nic_mutex);
+ 
+ 		LOG_DEBUG(PFX "%s: device disabled", nic->log_name);
+@@ -865,7 +887,7 @@ void nic_close_all()
+ 	nic = nic_list;
+ 	while (nic != NULL) {
+ 		pthread_mutex_lock(&nic->nic_mutex);
+-		nic_close(nic, 1);
++		nic_close(nic, 1, FREE_ALL_STRINGS);
+ 		pthread_mutex_unlock(&nic->nic_mutex);
+ 
+ 		nic = nic->next;
+@@ -1224,6 +1246,46 @@ nic_interface_t * nic_find_nic_iface_protocol(nic_t *nic,
+ 	return NULL;
+ }
+ 
++/**
++ *  unpersist_all_nic_iface() - Mark all the NIC interfaces as non-persistant
++ *                              Note: nic->nic_mutex must be taken
++ *  @param nic - NIC to mark as non-persistant
++ */
++void unpersist_all_nic_iface(nic_t *nic)
++{
++	nic_interface_t *current;
++
++	current = nic->nic_iface;
++	while (current != NULL)
++	{
++		current->flags &= ~NIC_IFACE_PERSIST;
++
++		current = current->next;
++	}
++}
++
++/**
++ *  persist_all_nic_iface() - Mark all the NIC interfaces as persistant
++ *                            Note: nic->nic_mutex must be taken
++ *  @param nic - NIC to mark as persistant
++ */
++void persist_all_nic_iface(nic_t *nic)
++{
++	nic_interface_t *current;
++
++	pthread_mutex_lock(&nic->nic_mutex);
++
++	current = nic->nic_iface;
++	while (current != NULL)
++	{
++		current->flags |= NIC_IFACE_PERSIST;
++
++		current = current->next;
++	}
++
++	pthread_mutex_unlock(&nic->nic_mutex);
++}
++
+ /*******************************************************************************
+  *  Packet management utility functions
+  ******************************************************************************/
+diff --git a/brcm_iscsi_uio/src/unix/nic_utils.h b/brcm_iscsi_uio/src/unix/nic_utils.h
+index 5034006..283e324 100644
+--- a/brcm_iscsi_uio/src/unix/nic_utils.h
++++ b/brcm_iscsi_uio/src/unix/nic_utils.h
+@@ -46,6 +46,10 @@ void nic_fill_ethernet_header(nic_interface_t *nic_iface,
+ 
+ nic_interface_t * nic_find_nic_iface(nic_t *nic,
+                                      uint16_t vlan_id);
++
++void unpersist_all_nic_iface(nic_t *nic);
++void persist_all_nic_iface(nic_t *nic);
++
+ int add_vlan_interfaces(nic_t *nic);
+ 
+ int nic_verify_uio_sysfs_name(nic_t *nic);
+@@ -56,7 +60,7 @@ uint32_t calculate_default_netmask(uint32_t ip_addr);
+ void prepare_nic(nic_t *nic);
+ 
+ int nic_enable(nic_t *nic);
+-int nic_disable(nic_t *nic);
++int nic_disable(nic_t *nic, int);
+ 
+ void dump_packet_to_log(struct nic_interface *iface,
+ 			uint8_t *buf, uint16_t buf_len);
+diff --git a/brcm_iscsi_uio/src/unix/uevent.c b/brcm_iscsi_uio/src/unix/uevent.c
+index 2019c64..4ff7e04 100644
+--- a/brcm_iscsi_uio/src/unix/uevent.c
++++ b/brcm_iscsi_uio/src/unix/uevent.c
+@@ -333,7 +333,7 @@ static int close_cnic_dev(struct parsed_uevent *event)
+ 	nic = nic_list;
+ 	while (nic != NULL) {
+ 		if (nic->uio_minor == minor) {
+-			nic_remove(nic, 1);
++			nic_remove(nic);
+ 
+ 			rc = 0;
+ 			break;
+-- 
+1.7.1
+

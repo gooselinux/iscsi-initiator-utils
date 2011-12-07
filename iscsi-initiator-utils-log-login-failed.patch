@@ -1,0 +1,138 @@
+diff -aurp open-iscsi-2.0-872-rc4-bnx2i/README open-iscsi-2.0-872-rc4-bnx2i.work/README
+--- open-iscsi-2.0-872-rc4-bnx2i/README	2010-08-18 03:14:34.000000000 -0500
++++ open-iscsi-2.0-872-rc4-bnx2i.work/README	2010-08-18 03:26:36.000000000 -0500
+@@ -403,8 +403,9 @@ this the following is not needed for sof
+ Warning!!!!!!
+ This feature is experimental. The interface may change. When reporting
+ bugs, if you cannot do a "ping -I ethX target_portal", then check your
+-network settings first. If you cannot ping the portal, then you will
+-not be able to bind a session to a NIC.
++network settings first. Make sure the rp_filter setting is set to 0 or 2
++(see Prep section below for more info). If you cannot ping the portal,
++then you will not be able to bind a session to a NIC.
+ 
+ What is a scsi_host and iface for software, hardware and partial
+ offload iscsi?
+@@ -422,6 +423,32 @@ structure. For each HBA port or for soft
+ device (ethX) or NIC, that you wish to bind sessions to you must create
+ a iface config /var/lib/iscsi/ifaces.
+ 
++Prep:
++
++The iface binding feature requires the sysctl setting
++net.ipv4.conf.default.rp_filter to be set to 0 or 2. This can be set
++in /etc/sysctl.conf by having the line:
++
++net.ipv4.conf.default.rp_filter = N
++
++where N is 0 or 2. Note that when setting this you may have to reboot
++the box for the value to take effect.
++
++
++rp_filter information from Documentation/networking/ip-sysctl.txt:
++
++rp_filter - INTEGER
++        0 - No source validation.
++        1 - Strict mode as defined in RFC3704 Strict Reverse Path
++            Each incoming packet is tested against the FIB and if the interface
++            is not the best reverse path the packet check will fail.
++            By default failed packets are discarded.
++        2 - Loose mode as defined in RFC3704 Loose Reverse Path
++            Each incoming packet's source address is also tested against the FIB
++            and if the source address is not reachable via any interface
++            the packet check will fail.
++
++
+ Running:
+ 
+ # iscsiadm -m iface
+diff -aurp open-iscsi-2.0-872-rc4-bnx2i/usr/initiator.c open-iscsi-2.0-872-rc4-bnx2i.work/usr/initiator.c
+--- open-iscsi-2.0-872-rc4-bnx2i/usr/initiator.c	2010-08-18 03:14:34.000000000 -0500
++++ open-iscsi-2.0-872-rc4-bnx2i.work/usr/initiator.c	2010-08-18 03:55:19.000000000 -0500
+@@ -850,11 +850,11 @@ session_conn_reopen(iscsi_conn_t *conn, 
+ 
+ static int iscsi_retry_initial_login(struct iscsi_conn *conn)
+ {
++	struct iscsi_session *session = conn->session;
+ 	int initial_login_retry_max;
+ 	struct timeval now, timeout, fail_time;
+ 
+-	initial_login_retry_max =
+-			conn->session->nrec.session.initial_login_retry_max;
++	initial_login_retry_max = session->nrec.session.initial_login_retry_max;
+ 
+ 	memset(&now, 0, sizeof(now));
+ 	memset(&timeout, 0, sizeof(timeout));
+@@ -864,7 +864,7 @@ static int iscsi_retry_initial_login(str
+ 	if (gettimeofday(&now, NULL)) {
+ 		log_error("Could not get time of day. Dropping down to "
+ 			  "max retry check.\n");
+-		return initial_login_retry_max > conn->session->reopen_cnt;
++		return initial_login_retry_max > session->reopen_cnt;
+ 	}
+ 	timeradd(&conn->initial_connect_time, &timeout, &fail_time);
+ 
+@@ -873,9 +873,13 @@ static int iscsi_retry_initial_login(str
+ 	 * then it is time to give up
+ 	 */
+ 	if (timercmp(&now, &fail_time, >)) {
+-		log_debug(1, "Giving up on initial login attempt after "
+-			  "%u seconds.\n",
+-			  initial_login_retry_max * conn->login_timeout);
++		log_error("Login timed out. Could not login to [target: %s, "
++			  "portal: %s,%d] through [iface: %s].",
++			  session->nrec.name,
++			  session->nrec.conn[conn->id].address,
++			  session->nrec.conn[conn->id].port,
++			  session->nrec.iface.name);
++		iscsi_warn_on_iface_cfg(&conn->session->nrec);
+ 		return 0;
+ 	}
+ 
+diff -aurp open-iscsi-2.0-872-rc4-bnx2i/usr/iscsi_util.c open-iscsi-2.0-872-rc4-bnx2i.work/usr/iscsi_util.c
+--- open-iscsi-2.0-872-rc4-bnx2i/usr/iscsi_util.c	2010-08-18 03:14:34.000000000 -0500
++++ open-iscsi-2.0-872-rc4-bnx2i.work/usr/iscsi_util.c	2010-08-18 03:14:58.000000000 -0500
+@@ -259,3 +259,16 @@ int iscsi_match_session(void *data, stru
+ 				     info->persistent_address,
+ 				     info->persistent_port, &info->iface);
+ }
++
++void iscsi_warn_on_iface_cfg(struct node_rec *rec)
++{
++	if (strcmp(rec->iface.name, DEFAULT_IFACENAME) &&
++	    !strcmp(rec->iface.transport_name, DEFAULT_TRANSPORT) &&
++	    (iface_is_bound_by_hwaddr(&rec->iface) ||
++	    iface_is_bound_by_netdev(&rec->iface)))
++		log_error("Make sure you can ping the portal with "
++			  "'ping -I ethX IP', and try adjusting "
++			  "net.ipv4.conf.default.rp_filter to 2 or 0 "
++			  "in /etc/sysctl.conf (a reboot may be needed "
++			  "after changing the sysctl settings).");
++}
+diff -aurp open-iscsi-2.0-872-rc4-bnx2i/usr/iscsi_util.h open-iscsi-2.0-872-rc4-bnx2i.work/usr/iscsi_util.h
+--- open-iscsi-2.0-872-rc4-bnx2i/usr/iscsi_util.h	2010-08-18 03:14:34.000000000 -0500
++++ open-iscsi-2.0-872-rc4-bnx2i.work/usr/iscsi_util.h	2010-08-18 03:14:58.000000000 -0500
+@@ -21,4 +21,6 @@ extern int __iscsi_match_session(struct 
+ extern char *strstrip(char *s);
+ extern char *cfg_get_string_param(char *pathname, const char *key);
+ 
++extern void iscsi_warn_on_iface_cfg(struct node_rec *rec);
++
+ #endif
+diff -aurp open-iscsi-2.0-872-rc4-bnx2i/usr/session_mgmt.c open-iscsi-2.0-872-rc4-bnx2i.work/usr/session_mgmt.c
+--- open-iscsi-2.0-872-rc4-bnx2i/usr/session_mgmt.c	2010-08-18 03:14:34.000000000 -0500
++++ open-iscsi-2.0-872-rc4-bnx2i.work/usr/session_mgmt.c	2010-08-18 03:14:58.000000000 -0500
+@@ -41,6 +41,13 @@ static void log_login_msg(struct node_re
+ 			  rec->name, rec->conn[0].address,
+ 			  rec->conn[0].port);
+ 		iscsid_handle_error(rc);
++
++		/*
++		 * If using iface binding with tcp then warn about
++		 * change in kernel behavior.
++		 */
++		if (rc == MGMT_IPC_ERR_TRANS_TIMEOUT)
++			iscsi_warn_on_iface_cfg(rec);
+ 	} else
+ 		log_info("Login to [iface: %s, target: %s, portal: "
+ 			 "%s,%d] successful.", rec->iface.name,

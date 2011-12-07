@@ -1,0 +1,28 @@
+From 4fa631cc1792680b0b7301b15d3bfde73dcb6e98 Mon Sep 17 00:00:00 2001
+From: Benjamin Li <benli@broadcom.com>
+Date: Mon, 2 Aug 2010 10:36:39 -0700
+Subject: [PATCH 4/4] Bump uIP version for RHEL6.0
+
+---
+ brcm_iscsi_uio/configure.ac |    4 ++--
+ 1 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/brcm_iscsi_uio/configure.ac b/brcm_iscsi_uio/configure.ac
+index 6cefcc5..7815240 100644
+--- a/brcm_iscsi_uio/configure.ac
++++ b/brcm_iscsi_uio/configure.ac
+@@ -10,9 +10,9 @@ dnl Written by: Benjamin Li  (benli@broadcom.com)
+ dnl
+ 
+ PACKAGE=brcm_iscsiuio
+-VERSION=0.5.15
++VERSION=0.5.15.rhel6.0.1
+ 
+-AC_INIT(brcm_iscsi, 0.5.15, benli@broadcom.com)
++AC_INIT(brcm_iscsi, 0.5.15.rhel6.0.1, benli@broadcom.com)
+ 
+ AM_INIT_AUTOMAKE($PACKAGE, $VERSION)
+ AC_CONFIG_HEADER(config.h)
+-- 
+1.7.1
+

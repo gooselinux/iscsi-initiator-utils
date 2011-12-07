@@ -1,0 +1,31 @@
+diff -aurp open-iscsi-2.0-871.1-bnx2i/brcm_iscsi_uio/src/unix/nic.c open-iscsi-2.0-871.1-bnx2i.work/brcm_iscsi_uio/src/unix/nic.c
+--- open-iscsi-2.0-871.1-bnx2i/brcm_iscsi_uio/src/unix/nic.c	2010-05-20 20:16:05.000000000 -0500
++++ open-iscsi-2.0-871.1-bnx2i.work/brcm_iscsi_uio/src/unix/nic.c	2010-07-07 21:32:22.000000000 -0500
+@@ -1168,6 +1168,7 @@ void *nic_loop(void *arg)
+ 		nic->start_time = time(NULL);
+ 		nic->flags &= ~NIC_UNITIALIZED;
+ 		nic->flags |= NIC_INITIALIZED;
++		nic->state &= ~NIC_STOPPED;
+ 		nic->state |= NIC_RUNNING;
+ 
+                 /*  Signal that the device enable is done */
+diff -aurp open-iscsi-2.0-871.1-bnx2i/brcm_iscsi_uio/src/unix/nic_utils.c open-iscsi-2.0-871.1-bnx2i.work/brcm_iscsi_uio/src/unix/nic_utils.c
+--- open-iscsi-2.0-871.1-bnx2i/brcm_iscsi_uio/src/unix/nic_utils.c	2010-05-20 20:16:05.000000000 -0500
++++ open-iscsi-2.0-871.1-bnx2i.work/brcm_iscsi_uio/src/unix/nic_utils.c	2010-07-07 21:32:22.000000000 -0500
+@@ -831,13 +831,14 @@ int nic_disable(nic_t *nic)
+ 	if( (nic->flags & NIC_ENABLED) &&
+ 	    (nic->state & NIC_RUNNING))
+ 	{
++		/*  Wait for the device to be disabled */
++		pthread_mutex_lock(&nic->nic_mutex);
++
+ 		nic->flags &= ~NIC_ENABLED;
+ 		nic->flags |= NIC_DISABLED;
+ 		nic->state &= ~NIC_RUNNING;
+ 		nic->state |= NIC_STOPPED;
+ 
+-		/*  Wait for the device to be disabled */
+-		pthread_mutex_lock(&nic->nic_mutex);
+ 		pthread_cond_wait(&nic->disable_wait_cond,
+ 				  &nic->nic_mutex);
+ 		pthread_mutex_unlock(&nic->nic_mutex);
